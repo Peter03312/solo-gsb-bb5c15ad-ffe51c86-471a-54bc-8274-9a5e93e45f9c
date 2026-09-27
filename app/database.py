@@ -51,6 +51,13 @@ old_*，delete 无 new_*）。注册、预占确认、改名、交换（含事�
   审计触发器完整存在。旧库只有 name_events 表而缺触发器、或迁移完成后
   触发器被移除时，抛出指明缺失触发器的 MigrationError（首次接管的基线
   事务整体回滚，不留部分记录）——否则注册 / 改名 / 释放会静默漏记事件。
+- 规范名唯一约束核实：display_names 表已存在时（首次接管的基线判定、
+  已有迁移记录的启动校验、逐迁移应用前），都要求该表存在覆盖且仅覆盖
+  (namespace, normalized_name) 的完整唯一键——表级 UNIQUE 约束或等价
+  唯一索引均可，两列顺序与索引名称不限；部分索引、表达式索引、含额外
+  键列或非 BINARY 排序规则的索引均不能充当该约束。缺失时抛出指明表与
+  约束的 MigrationError（首次接管的基线事务整体回滚，不补记基线、不改
+  业务数据）——否则规范名查重失去数据库层兜底，重复规范名可静默写入。
 
 命令行：
     python -m app.database migrate   # 执行全部待应用迁移（幂等）
@@ -293,6 +300,12 @@ _AUDIT_TRIGGERS: tuple[str, ...] = (
     "trg_display_names_audit_delete",
 )
 
+# 规范名唯一约束：display_names 上必须存在覆盖且仅覆盖这两列的完整唯一键
+# （表级 UNIQUE 约束或等价唯一索引）。它是规范名查重的数据库层兜底：旧库
+# 缺该约束时重复规范名可静默写入，迁移入口必须核实其就位后才允许启动。
+_DISPLAY_NAMES_TABLE = "display_names"
+_DISPLAY_NAMES_UNIQUE_COLUMNS: tuple[str, str] = ("namespace", "normalized_name")
+
 
 class MigrationError(RuntimeError):
     """迁移校验或执行失败：错误信息指明具体版本号，应用必须中止启动。"""
@@ -370,6 +383,66 @@ def _validate_audit_triggers(conn: sqlite3.Connection, applied: set[int]) -> Non
         )
 
 
+def _has_display_names_unique_key(conn: sqlite3.Connection) -> bool:
+    """display_names 是否存在覆盖且仅覆盖规范名唯一列的完整唯一键。
+
+    逐一检查该表的全部唯一索引（含表级 UNIQUE 约束 / 主键的自动索引与独立
+    唯一索引；列顺序与索引名称不限），存在满足以下全部条件的索引即视为
+    约束就位：
+
+    - 非部分索引（无 WHERE 子句）：部分唯一索引只在行子集上查重
+    - 键列恰好为 namespace 与 normalized_name 两列：多出的键列会放宽
+      唯一性（允许同规范名重复），缺列则根本不是该约束
+    - 两个键列都是表列而非表达式：表达式索引的唯一性不作用于列值本身
+    - 两个键列的排序规则都是 BINARY：NOCASE 等排序规则会改变查重语义
+    """
+    columns_by_cid = {
+        row[0]: row[1]
+        for row in conn.execute(f"PRAGMA table_info({_DISPLAY_NAMES_TABLE})")
+    }
+    for row in conn.execute(f"PRAGMA index_list({_DISPLAY_NAMES_TABLE})"):
+        _, index_name, unique, _origin, partial = row
+        if not unique or partial:
+            continue
+        quoted_name = '"' + index_name.replace('"', '""') + '"'
+        # key=1 只保留键列（忽略 rowid 等辅助列）
+        key_columns = [
+            xinfo
+            for xinfo in conn.execute(f"PRAGMA index_xinfo({quoted_name})")
+            if xinfo[5]
+        ]
+        if len(key_columns) != len(_DISPLAY_NAMES_UNIQUE_COLUMNS):
+            continue
+        if any(xinfo[2] is None for xinfo in key_columns):  # 表达式键列
+            continue
+        if any(xinfo[4] != "BINARY" for xinfo in key_columns):
+            continue
+        key_column_names = {columns_by_cid.get(xinfo[1]) for xinfo in key_columns}
+        if key_column_names == set(_DISPLAY_NAMES_UNIQUE_COLUMNS):
+            return True
+    return False
+
+
+def _validate_display_names_unique_key(conn: sqlite3.Connection) -> None:
+    """display_names 已存在时，核实其规范名唯一约束就位。
+
+    缺少覆盖且仅覆盖 (namespace, normalized_name) 的完整唯一键时，规范名
+    查重失去数据库层兜底，重复规范名可静默写入，因此抛出指明表与约束的
+    MigrationError，拒绝启动（调用方保证不补记基线、不改业务数据）。
+    """
+    if _DISPLAY_NAMES_TABLE not in _table_names(conn):
+        return
+    if not _has_display_names_unique_key(conn):
+        raise MigrationError(
+            f"表 {_DISPLAY_NAMES_TABLE} 缺少覆盖且仅覆盖 "
+            f"({', '.join(_DISPLAY_NAMES_UNIQUE_COLUMNS)}) 的完整唯一键"
+            "（表级 UNIQUE 约束或等价唯一索引；部分索引、表达式索引、含额外"
+            "键列或非 BINARY 排序规则的索引均不能充当该约束）：规范名查重"
+            "失去数据库层兜底，重复规范名可静默写入，拒绝启动。请为该表补齐 "
+            "UNIQUE (namespace, normalized_name) 约束后重试"
+        )
+
+
 def _read_recorded(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
     """读取 schema_migrations 中已记录的迁移（按版本升序），须在建表之后调用。"""
     rows = conn.execute(
@@ -426,8 +499,9 @@ def _baseline_if_first_takeover(conn: sqlite3.Connection) -> bool:
     整个判定与写入在单个 BEGIN IMMEDIATE 事务内完成：并发进程同时首次接管
     同一数据库时，后到者在持锁重读后看到基线已存在，直接跳过不重复写入
     （其后的逐迁移应用会校验这些记录的校验和）。基线把 v6 记为已应用之前
-    会先核实 display_names 审计触发器完整；缺失时抛 MigrationError 并整体
-    回滚，不留下部分基线记录。
+    会先核实 display_names 审计触发器完整，并核实其规范名唯一键就位；
+    任一缺失时抛 MigrationError 并整体回滚，不留下部分基线记录、不改业务
+    数据。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -439,6 +513,8 @@ def _baseline_if_first_takeover(conn: sqlite3.Connection) -> bool:
         detected = _detect_legacy_applied(conn)
         # 旧库可能已有 name_events 表却缺审计触发器：v6 不能记为已应用
         _validate_audit_triggers(conn, detected)
+        # 旧库的 display_names 可能缺规范名唯一约束：缺约束不建基线
+        _validate_display_names_unique_key(conn)
         for version in sorted(detected):
             migration = _MIGRATIONS_BY_VERSION[version]
             conn.execute(
@@ -457,15 +533,16 @@ def _apply_one(conn: sqlite3.Connection, migration: Migration) -> bool:
     """在单个 BEGIN IMMEDIATE 事务内应用一个迁移；已被并发应用则跳过。
 
     持写锁后重新读取已记录版本并校验（防改写 / 防未知版本；已记录 v6 时
-    一并核实审计触发器完整），该迁移已记录则直接提交返回；否则在同一事务
-    内执行全部迁移语句并写入历史记录后原子提交。任一语句失败整体回滚，
-    不会留下半个迁移。
+    一并核实审计触发器完整；display_names 已存在时核实规范名唯一键就位），
+    该迁移已记录则直接提交返回；否则在同一事务内执行全部迁移语句并写入
+    历史记录后原子提交。任一语句失败整体回滚，不会留下半个迁移。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         recorded = _read_recorded(conn)
         _validate_recorded(recorded, check_gaps=False)
         _validate_audit_triggers(conn, set(recorded))
+        _validate_display_names_unique_key(conn)
         if migration.version in recorded:
             conn.commit()
             return False
@@ -491,7 +568,10 @@ def migrate(path: str | None = None) -> list[int]:
     不会重复执行同一迁移。迁移文件被改写、出现未知版本或版本缺口时抛出
     MigrationError（含具体版本号），调用方应中止启动。v6 被视为已应用
     （已记录或基线判定）时还会核实 display_names 审计触发器完整，缺失
-    同样抛出 MigrationError（指明缺失的触发器）。
+    同样抛出 MigrationError（指明缺失的触发器）。display_names 已存在时
+    还会核实其 (namespace, normalized_name) 唯一约束就位（部分索引、
+    表达式索引、含额外键列或非 BINARY 排序规则均不算数），缺失抛出
+    指明表与约束的 MigrationError；首次接管时基线事务整体回滚。
     """
     target = path or DATABASE_PATH
     if target != ":memory:":
@@ -512,6 +592,9 @@ def migrate(path: str | None = None) -> list[int]:
             if recorded:
                 _validate_recorded(recorded, check_gaps=True)
                 _validate_audit_triggers(conn, set(recorded))
+                # 迁移完成后约束可能被移除（如重建表时漏掉 UNIQUE）：
+                # 应用后续迁移前核实规范名唯一键仍在
+                _validate_display_names_unique_key(conn)
             conn.commit()
         except BaseException:
             conn.rollback()

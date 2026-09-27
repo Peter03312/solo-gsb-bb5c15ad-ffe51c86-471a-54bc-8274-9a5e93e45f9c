@@ -40,8 +40,8 @@ docker compose up --build
 该命令完成镜像构建、依赖安装、**版本化数据库迁移**与 API 启动：容器启动时先执行
 `python -m app.database migrate`（按递增版本逐个原子提交，多实例并发启动安全；
 首次接管老版本数据库自动建立基线，详见下文「数据库迁移」），迁移成功后才启动
-uvicorn；迁移校验失败（迁移文件被改写 / 版本缺口 / 审计触发器缺失）时容器以
-非零码退出，API 不会带病启动。SQLite 文件落在命名卷 `names-data` 中。容器启动后即可直接使用全部接口
+uvicorn；迁移校验失败（迁移文件被改写 / 版本缺口 / 审计触发器缺失 / 规范名唯一
+约束缺失）时容器以非零码退出，API 不会带病启动。SQLite 文件落在命名卷 `names-data` 中。容器启动后即可直接使用全部接口
 （含 `PUT/GET /namespaces/{namespace}/script-policy`、`POST /namespaces/{source}/merge`、
 `DELETE /namespaces/{namespace}/names/{id}` 释放冷却、`POST /name-risk-clusters`
 跨空间同形风险簇、`POST /namespaces/{namespace}/snapshot-proof` 快照 Merkle
@@ -68,7 +68,9 @@ python -m app.database status    # 只读输出已应用 / 待应用 / 校验异
 - **首次接管既有数据库**：`schema_migrations` 为空但业务表已存在时，按当前
   表 / 列状态识别各迁移效果（如 `display_names` 是否已有 `revision` 列），
   把已生效的迁移补记为基线，随后只执行缺失的迁移；空库则从头执行全部迁移，
-  两条路径最终结构一致。
+  两条路径最终结构一致。建基线前还会核实 `display_names` 带有覆盖且仅覆盖
+  `(namespace, normalized_name)` 的完整唯一键（见下文「规范名唯一约束核实」），
+  不合格时整体回滚、不补记基线。
 - **失败即拒启**：已记录迁移对应的迁移文件被改写（校验和不匹配）、记录了
   未知版本或版本历史出现缺口时，`migrate` 以非零码退出并指明具体版本号，
   应用启动失败、不继续服务。`status` 为纯只读（不建表、不建基线、不执行
@@ -81,6 +83,18 @@ python -m app.database status    # 只读输出已应用 / 待应用 / 校验异
   `MigrationError` 并以非零码退出（首次接管的基线事务整体回滚，不留部分
   记录）——否则注册 / 改名 / 释放会静默漏记变更事件。按 v6 的触发器定义
   补齐缺失触发器后即可正常启动。
+- **规范名唯一约束核实**：`display_names` 表已存在时（首次接管建基线、
+  已有迁移记录的启动校验、逐迁移应用前），迁移入口都会核实该表存在
+  **覆盖且仅覆盖 `(namespace, normalized_name)` 的完整唯一键**——表级
+  `UNIQUE` 约束或等价的独立唯一索引均可，两列顺序与索引名称不限；
+  **部分索引（带 `WHERE`）、表达式索引（如 `lower(...)`）、含额外键列
+  或非 `BINARY` 排序规则（如 `COLLATE NOCASE`）的索引均不能充当该约束**，
+  普通非唯一索引同样不算。缺失时 `migrate` 抛出指明表与约束的
+  `MigrationError` 并以非零码退出：首次接管时基线事务整体回滚，**不补记
+  基线、不改业务数据**（重复规范名原样保留，需运维先清理脏数据并补齐
+  `UNIQUE (namespace, normalized_name)` 约束）——否则规范名查重失去数据库
+  层兜底，重复规范名可静默写入。空库（由 v1 迁移直接建表）与带合格唯一
+  约束的旧库不受影响，迁移路径不变。
 
 ## 本地开发（单条命令）
 

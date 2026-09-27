@@ -5018,6 +5018,231 @@ def test_migrate_fails_when_audit_trigger_dropped_after_migration(tmp_path):
         ).fetchall() == [("insert",), ("update",)]
 
 
+# ---------- 规范名唯一约束（display_names UNIQUE 键核实） ----------
+
+
+def _legacy_display_names_db(
+    db_path,
+    index_sql=None,
+    *,
+    with_duplicate=False,
+    normalized_collation=None,
+    with_unique=True,
+):
+    """构造旧库：仅一张 display_names 表（可带指定索引）并写入业务数据。
+
+    with_duplicate=True 时写入两条规范名相同的行——只有缺唯一约束的库
+    才允许这样做，用来验证迁移入口不会补记基线、也不会改动业务数据。
+    index_sql 非空时只建裸表并执行该索引语句（用以构造部分 / 表达式等
+    不合格“唯一键”）；with_unique=False 时连表级 UNIQUE 也不建。
+    normalized_collation 给 normalized_name 列指定排序规则（列级 COLLATE
+    会被唯一索引继承，非 BINARY 排序规则不算合格约束）。
+    """
+    import sqlite3
+
+    norm_column = "normalized_name TEXT NOT NULL"
+    if normalized_collation:
+        norm_column += f" COLLATE {normalized_collation}"
+    # 表级 UNIQUE 与显式索引互斥；二者皆无时为完全缺约束的裸表
+    table_clause = (
+        ",\n                UNIQUE (namespace, normalized_name)"
+        if with_unique and index_sql is None
+        else ""
+    )
+    with sqlite3.connect(db_path) as legacy:
+        legacy.execute(
+            f"""
+            CREATE TABLE display_names (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace       TEXT NOT NULL,
+                original_name   TEXT NOT NULL,
+                {norm_column},
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                {table_clause}
+            )
+            """
+        )
+        if index_sql:
+            legacy.execute(index_sql)
+        legacy.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Alice', 'alice')"
+        )
+        if with_duplicate:
+            legacy.execute(
+                "INSERT INTO display_names (namespace, original_name, normalized_name) "
+                "VALUES ('chat', 'ALICE!', 'alice')"
+            )
+        legacy.commit()
+
+
+def test_migrate_fails_when_legacy_db_missing_normalized_unique_constraint(tmp_path):
+    """旧库有 display_names 表却缺规范名唯一约束：拒绝接管，不建基线、不改数据。
+
+    错误须指明表与约束；schema_migrations 不留部分基线记录；已有业务数据
+    （含重复规范名）原样保留。清理重复行并补齐 UNIQUE 索引后可正常接管。
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy-no-unique.db"
+    _legacy_display_names_db(db_path, with_duplicate=True, with_unique=False)
+
+    # 迁移前重复规范名确实可以写入（约束缺失的危害）
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM display_names WHERE normalized_name = 'alice'"
+        ).fetchone() == (2,)
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.init_db(str(db_path))
+    message = str(exc_info.value)
+    assert "display_names" in message  # 指明表
+    assert "namespace" in message and "normalized_name" in message  # 指明约束
+
+    with sqlite3.connect(db_path) as conn:
+        # 建基线事务整体回滚：不留下任何部分基线记录
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone() == (0,)
+        # 业务数据原样保留（不删重复、不去重）
+        assert conn.execute("SELECT COUNT(*) FROM display_names").fetchone() == (2,)
+        # 结构未被改动：仍没有任何唯一索引
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND "
+            "name NOT LIKE 'sqlite_%'"
+        ).fetchone() == (0,)
+
+    # 不清理重复行直接补唯一索引也会失败（索引本身建不起来），由运维先处理脏数据；
+    # 删除重复行后，以任意名称的等价唯一索引补齐约束，旧库可正常接管
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM display_names WHERE id = 2")
+        # 两列顺序调换、索引名自定义：仍构成覆盖且仅覆盖两列的完整唯一键
+        conn.execute(
+            "CREATE UNIQUE INDEX uk_display_names_norm_namespace "
+            "ON display_names (normalized_name, namespace)"
+        )
+        conn.commit()
+    assert database.migrate(str(db_path)) == [2, 3, 4, 5, 6]
+    with sqlite3.connect(db_path) as conn:
+        versions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        assert versions == [1, 2, 3, 4, 5, 6]
+        assert conn.execute("SELECT COUNT(*) FROM display_names").fetchone() == (1,)
+
+
+# 不能充当 (namespace, normalized_name) 完整唯一键的各类索引：
+# 部分索引、表达式索引、含额外键列、单列、非 BINARY 排序规则、非唯一索引
+_INVALID_UNIQUE_INDEXES = [
+    "CREATE UNIQUE INDEX ix ON display_names (namespace, normalized_name) "
+    "WHERE created_at IS NOT NULL",
+    "CREATE UNIQUE INDEX ix ON display_names (namespace, lower(normalized_name))",
+    "CREATE UNIQUE INDEX ix ON display_names (namespace, normalized_name, original_name)",
+    "CREATE UNIQUE INDEX ix ON display_names (namespace)",
+    "CREATE UNIQUE INDEX ix ON display_names (namespace, normalized_name COLLATE NOCASE)",
+    "CREATE INDEX ix ON display_names (namespace, normalized_name)",
+]
+
+
+@pytest.mark.parametrize("index_sql", _INVALID_UNIQUE_INDEXES)
+def test_migrate_rejects_indexes_that_do_not_cover_exact_unique_key(tmp_path, index_sql):
+    """部分 / 表达式 / 额外键列 / 单列 / 非 BINARY 排序规则 / 非唯一索引均不算该约束。"""
+    db_path = tmp_path / "legacy-bad-index.db"
+    _legacy_display_names_db(db_path, index_sql=index_sql)
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.migrate(str(db_path))
+    message = str(exc_info.value)
+    assert "display_names" in message
+    assert "namespace" in message and "normalized_name" in message
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone() == (0,)
+
+
+def test_migrate_accepts_desc_index_with_binary_collation(tmp_path):
+    """纯排序方向（DESC）不改变唯一性：两列 BINARY 的 DESC 唯一索引是合格约束。"""
+    db_path = tmp_path / "legacy-desc-index.db"
+    _legacy_display_names_db(
+        db_path,
+        index_sql=(
+            "CREATE UNIQUE INDEX ix ON display_names "
+            "(namespace DESC, normalized_name ASC)"
+        ),
+    )
+    assert database.migrate(str(db_path)) == [2, 3, 4, 5, 6]
+
+
+def test_migrate_rejects_unique_index_inheriting_column_level_nocase(tmp_path):
+    """列级非 BINARY 排序规则被唯一索引继承：表级 UNIQUE 自动索引同样不合格。"""
+    db_path = tmp_path / "legacy-column-collation.db"
+    _legacy_display_names_db(db_path, normalized_collation="NOCASE")
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.migrate(str(db_path))
+    assert "display_names" in str(exc_info.value)
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone() == (0,)
+
+
+def test_migrate_fails_when_unique_key_dropped_after_takeover(tmp_path):
+    """迁移完成后唯一索引被移除：应用后续迁移前的启动校验拒绝继续。
+
+    合格旧库以命名唯一索引接管；接管后 DROP INDEX 去掉约束，启动迁移必须
+    失败（迁移历史不改动），补回等价唯一键（调换列顺序）后恢复可启动。
+    """
+    import sqlite3
+
+    db_path = tmp_path / "dropped-unique.db"
+    _legacy_display_names_db(
+        db_path,
+        index_sql=(
+            "CREATE UNIQUE INDEX uk_names ON display_names "
+            "(namespace, normalized_name)"
+        ),
+    )
+    assert database.migrate(str(db_path)) == [2, 3, 4, 5, 6]
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP INDEX uk_names")
+        conn.commit()
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.init_db(str(db_path))
+    assert "display_names" in str(exc_info.value)
+
+    # 迁移历史记录本身未被改动
+    with sqlite3.connect(db_path) as conn:
+        versions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        assert versions == [1, 2, 3, 4, 5, 6]
+
+    # 补回覆盖同样两列的唯一键（列顺序可不同）后恢复可启动
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE UNIQUE INDEX uk_names ON display_names "
+            "(normalized_name, namespace)"
+        )
+        conn.commit()
+    assert database.migrate(str(db_path)) == []
+
+
 # ---------- 提交后竞态：成功响应必须固定为写事务完成时的记录 ----------
 #
 # 旧实现的各写入口在 COMMIT 成功之后才重新查库组装成功响应；提交与重查之间
